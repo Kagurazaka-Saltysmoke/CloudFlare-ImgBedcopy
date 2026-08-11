@@ -43,10 +43,10 @@ jobs:
         run: |
           TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
 
-          # Tree comparison: ignore whitelist paths, if remaining tree is identical → skip
+          # Tree comparison: ignore whitelist paths (.github 整目录),
+          # if remaining tree is identical → skip
           if git diff --quiet "$TARGET_SHA" HEAD -- . \
-            ':(exclude).github/workflows/deploy-worker.yml' \
-            ':(exclude).github/workflows/sync-upstream.yml'; then
+            ':(exclude).github'; then
             echo "Already up to date with $TARGET_SHA — skipping."
             echo "needs_update=false" >> $GITHUB_OUTPUT
           else
@@ -64,13 +64,22 @@ jobs:
           KEEP_DIR="/tmp/keep"
           mkdir -p "$KEEP_DIR"
 
-          # --- Whitelist definition ---
-          WHITELIST_FILES=(
-            ".github/workflows/deploy-worker.yml"
-            ".github/workflows/sync-upstream.yml"
-          )
+          # --- Whitelist definition: .github 整目录（含本 workflow 自身 + deploy-worker）---
+          # 完全保留本地版，commit 不含 workflow 文件变更，
+          # push 无需 workflows 权限，也不会把上游 workflow 漂移进来。
+          WHITELIST_DIRS=( ".github" )
+          WHITELIST_FILES=()
 
-          # 1. Backup whitelist files
+          # 1. Backup whitelist directories
+          for dir in "${WHITELIST_DIRS[@]}"; do
+            if [ -d "$dir" ]; then
+              mkdir -p "$KEEP_DIR/$dir"
+              cp -r "$dir/." "$KEEP_DIR/$dir/"
+              echo "Backed up directory: $dir"
+            fi
+          done
+
+          # Backup whitelist files
           for f in "${WHITELIST_FILES[@]}"; do
             if [ -f "$f" ]; then
               mkdir -p "$KEEP_DIR/$(dirname "$f")"
@@ -84,10 +93,18 @@ jobs:
           # 2. Nuke all tracked files
           git rm -rq --ignore-unmatch .
 
-          # 3. Checkout upstream tree at TARGET_SHA
-          git checkout "$TARGET_SHA" -- .
+          # 3. Checkout upstream tree at TARGET_SHA (exclude .github entirely)
+          git checkout "$TARGET_SHA" -- . ':(exclude).github'
 
           # 4. Restore whitelist files from backup
+          for dir in "${WHITELIST_DIRS[@]}"; do
+            if [ -d "$KEEP_DIR/$dir" ]; then
+              mkdir -p "$dir"
+              cp -r "$KEEP_DIR/$dir/." "$dir/"
+              echo "Restored directory: $dir"
+            fi
+          done
+
           for f in "${WHITELIST_FILES[@]}"; do
             if [ -f "$KEEP_DIR/$f" ]; then
               mkdir -p "$(dirname "$f")"
@@ -101,6 +118,23 @@ jobs:
 
           HAS_DIFF=false
 
+          # Check files inside whitelist directories
+          for dir in "${WHITELIST_DIRS[@]}"; do
+            if [ -d "$KEEP_DIR/$dir" ]; then
+              for local_file in $(find "$KEEP_DIR/$dir" -type f); do
+                rel_path="${local_file#$KEEP_DIR/}"
+                upstream_content=$(git show "$TARGET_SHA:$rel_path" 2>/dev/null || true)
+                if [ -z "$upstream_content" ]; then
+                  echo "- ℹ️ \`$rel_path\` — 本地预期保留（上游不存在）" >> $GITHUB_STEP_SUMMARY
+                elif ! diff -q <(echo "$upstream_content") "$rel_path" > /dev/null 2>&1; then
+                  echo "- ⚠️ \`$rel_path\` — differs from upstream; review manually" >> $GITHUB_STEP_SUMMARY
+                  HAS_DIFF=true
+                fi
+              done
+            fi
+          done
+
+          # Check individual whitelist files
           for f in "${WHITELIST_FILES[@]}"; do
             if [ -f "$f" ]; then
               upstream_content=$(git show "$TARGET_SHA:$f" 2>/dev/null || true)
@@ -116,7 +150,6 @@ jobs:
           if [ "$HAS_DIFF" = false ]; then
             echo "- ✅ All whitelist files match upstream — no action needed" >> $GITHUB_STEP_SUMMARY
           fi
-
           # 6. Commit
           git add -A
           if git diff --cached --quiet; then
