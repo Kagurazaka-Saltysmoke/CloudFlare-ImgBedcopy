@@ -9,6 +9,10 @@ permissions:
   contents: write
   actions: write
 
+concurrency:
+  group: sync-upstream-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -22,21 +26,20 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Resolve target commit
+      - name: Add upstream and resolve target commit
         id: resolve
         run: |
-          TARGET_SHA=$(git ls-remote https://github.com/MarSeventh/CloudFlare-ImgBed.git refs/heads/main | cut -f1)
+          git remote add upstream https://github.com/MarSeventh/CloudFlare-ImgBed.git || true
+          # Fetch first, then resolve from the tracking ref — atomic and
+          # immune to a force-push race between ls-remote and fetch.
+          git fetch upstream '+refs/heads/main:refs/remotes/upstream/main'
+          TARGET_SHA=$(git rev-parse refs/remotes/upstream/main)
           if [ -z "$TARGET_SHA" ]; then
             echo "Failed to resolve upstream main HEAD."
             exit 1
           fi
           echo "target_sha=$TARGET_SHA" >> $GITHUB_OUTPUT
           echo "Upstream main HEAD: $TARGET_SHA"
-
-      - name: Add upstream
-        run: |
-          git remote add upstream https://github.com/MarSeventh/CloudFlare-ImgBed.git || true
-          git fetch upstream main
 
       - name: Check if update is needed
         id: check
@@ -118,29 +121,41 @@ jobs:
 
           HAS_DIFF=false
 
+          # Report upstream changes in whitelist paths (added/removed/modified)
+          # via name-status — covers upstream additions we don't have locally.
+          while IFS= read -r status_path; do
+            [ -n "$status_path" ] || continue
+            st="${status_path%%$'\t'*}"
+            rel_path="${status_path#*$'\t'}"
+            case "$st" in
+              A|M|D|T)
+                echo "- ⚠️ \`$rel_path\` — upstream ${st}: review manually" >> $GITHUB_STEP_SUMMARY
+                HAS_DIFF=true
+                ;;
+            esac
+          done < <(git diff --name-status "$TARGET_SHA" HEAD -- .github)
+
           # Check files inside whitelist directories
           for dir in "${WHITELIST_DIRS[@]}"; do
             if [ -d "$KEEP_DIR/$dir" ]; then
-              for local_file in $(find "$KEEP_DIR/$dir" -type f); do
+              while IFS= read -r -d '' local_file; do
                 rel_path="${local_file#$KEEP_DIR/}"
-                upstream_content=$(git show "$TARGET_SHA:$rel_path" 2>/dev/null || true)
-                if [ -z "$upstream_content" ]; then
+                if ! git cat-file -e "$TARGET_SHA:$rel_path" 2>/dev/null; then
                   echo "- ℹ️ \`$rel_path\` — 本地预期保留（上游不存在）" >> $GITHUB_STEP_SUMMARY
-                elif ! diff -q <(echo "$upstream_content") "$rel_path" > /dev/null 2>&1; then
+                elif ! git show "$TARGET_SHA:$rel_path" | cmp -s - "$rel_path"; then
                   echo "- ⚠️ \`$rel_path\` — differs from upstream; review manually" >> $GITHUB_STEP_SUMMARY
                   HAS_DIFF=true
                 fi
-              done
+              done < <(find "$KEEP_DIR/$dir" -type f -print0)
             fi
           done
 
           # Check individual whitelist files
           for f in "${WHITELIST_FILES[@]}"; do
             if [ -f "$f" ]; then
-              upstream_content=$(git show "$TARGET_SHA:$f" 2>/dev/null || true)
-              if [ -z "$upstream_content" ]; then
+              if ! git cat-file -e "$TARGET_SHA:$f" 2>/dev/null; then
                 echo "- ℹ️ \`$f\` — 本地预期保留（上游不存在）" >> $GITHUB_STEP_SUMMARY
-              elif ! diff -q <(echo "$upstream_content") "$f" > /dev/null 2>&1; then
+              elif ! git show "$TARGET_SHA:$f" | cmp -s - "$f"; then
                 echo "- ⚠️ \`$f\` — differs from upstream; review manually" >> $GITHUB_STEP_SUMMARY
                 HAS_DIFF=true
               fi
@@ -150,6 +165,7 @@ jobs:
           if [ "$HAS_DIFF" = false ]; then
             echo "- ✅ All whitelist files match upstream — no action needed" >> $GITHUB_STEP_SUMMARY
           fi
+
           # 6. Commit
           git add -A
           if git diff --cached --quiet; then
