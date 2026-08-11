@@ -1,47 +1,151 @@
-name: Upstream Sync
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: write
   actions: write
 
-on:
-  schedule:
-    - cron: "0 0 * * *" # every day
-  workflow_dispatch:
-
 jobs:
-  sync_latest_from_upstream:
-    name: Sync latest commits from upstream repo
+  sync:
     runs-on: ubuntu-latest
-    if: ${{ github.event.repository.fork }}
-
     steps:
-      # Step 1: run a standard checkout action
-      - name: Checkout target repo
-        uses: actions/checkout@v6
-
-      # Step 2: run the sync action
-      - name: Sync upstream changes
-        id: sync
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+      - uses: actions/checkout@v4
         with:
-          upstream_sync_repo: MarSeventh/CloudFlare-ImgBed
-          upstream_sync_branch: main
-          target_sync_branch: main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }} # automatically generated, no need to set
+          fetch-depth: 0
 
-          # Set test_mode true to run tests instead of the true action!!
-          test_mode: false
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Trigger Worker deploy
-        if: success()
+      - name: Resolve target commit
+        id: resolve
+        run: |
+          TARGET_SHA=$(git ls-remote https://github.com/MarSeventh/CloudFlare-ImgBed.git refs/heads/main | cut -f1)
+          if [ -z "$TARGET_SHA" ]; then
+            echo "Failed to resolve upstream main HEAD."
+            exit 1
+          fi
+          echo "target_sha=$TARGET_SHA" >> $GITHUB_OUTPUT
+          echo "Upstream main HEAD: $TARGET_SHA"
+
+      - name: Add upstream
+        run: |
+          git remote add upstream https://github.com/MarSeventh/CloudFlare-ImgBed.git || true
+          git fetch upstream main
+
+      - name: Check if update is needed
+        id: check
+        run: |
+          TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
+
+          # Tree comparison: ignore whitelist paths, if remaining tree is identical → skip
+          if git diff --quiet "$TARGET_SHA" HEAD -- . \
+            ':(exclude).github/workflows/deploy-worker.yml' \
+            ':(exclude).github/workflows/sync-upstream.yml'; then
+            echo "Already up to date with $TARGET_SHA — skipping."
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+          else
+            echo "Update needed — target: $TARGET_SHA"
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Apply update
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          set -euo pipefail
+
+          TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
+
+          KEEP_DIR="/tmp/keep"
+          mkdir -p "$KEEP_DIR"
+
+          # --- Whitelist definition ---
+          WHITELIST_FILES=(
+            ".github/workflows/deploy-worker.yml"
+            ".github/workflows/sync-upstream.yml"
+          )
+
+          # 1. Backup whitelist files
+          for f in "${WHITELIST_FILES[@]}"; do
+            if [ -f "$f" ]; then
+              mkdir -p "$KEEP_DIR/$(dirname "$f")"
+              cp "$f" "$KEEP_DIR/$f"
+              echo "Backed up file: $f"
+            else
+              echo "::warning::Whitelist file not found, skipping backup: $f"
+            fi
+          done
+
+          # 2. Nuke all tracked files
+          git rm -rq --ignore-unmatch .
+
+          # 3. Checkout upstream tree at TARGET_SHA
+          git checkout "$TARGET_SHA" -- .
+
+          # 4. Restore whitelist files from backup
+          for f in "${WHITELIST_FILES[@]}"; do
+            if [ -f "$KEEP_DIR/$f" ]; then
+              mkdir -p "$(dirname "$f")"
+              cp "$KEEP_DIR/$f" "$f"
+              echo "Restored file: $f"
+            fi
+          done
+
+          # 5. Diff alert: compare upstream vs local for each whitelist entry
+          echo "### ⚠️ Whitelist Diff Report" >> $GITHUB_STEP_SUMMARY
+
+          HAS_DIFF=false
+
+          for f in "${WHITELIST_FILES[@]}"; do
+            if [ -f "$f" ]; then
+              upstream_content=$(git show "$TARGET_SHA:$f" 2>/dev/null || true)
+              if [ -z "$upstream_content" ]; then
+                echo "- ℹ️ \`$f\` — 本地预期保留（上游不存在）" >> $GITHUB_STEP_SUMMARY
+              elif ! diff -q <(echo "$upstream_content") "$f" > /dev/null 2>&1; then
+                echo "- ⚠️ \`$f\` — differs from upstream; review manually" >> $GITHUB_STEP_SUMMARY
+                HAS_DIFF=true
+              fi
+            fi
+          done
+
+          if [ "$HAS_DIFF" = false ]; then
+            echo "- ✅ All whitelist files match upstream — no action needed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # 6. Commit
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit after overlay — skipping."
+          else
+            git commit -m "chore: sync with upstream $TARGET_SHA"
+          fi
+
+          rm -rf "$KEEP_DIR"
+
+      - name: Push
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          git push origin main
+
+      - name: Trigger deploy
+        if: steps.check.outputs.needs_update == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run deploy-worker.yml --repo "${{ github.repository }}" --ref main
-
-      - name: Sync check
-        if: failure()
         run: |
-          echo "[Error] 由于上游仓库的 workflow 文件变更，导致 GitHub 自动暂停了本次自动更新，你需要手动 Sync Fork 一次。"
-          echo "[Error] Due to a change in the workflow file of the upstream repository, GitHub has automatically suspended the scheduled automatic update. You need to manually sync your fork."
-          exit 1
+          gh workflow run deploy-worker.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo "Triggered deploy-worker.yml"
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.check.outputs.needs_update }}" = "true" ]; then
+            echo "### Synced successfully" >> $GITHUB_STEP_SUMMARY
+            echo "- **Commit:** \`${{ steps.resolve.outputs.target_sha }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Deploy:** triggered ✅" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Nothing to update" >> $GITHUB_STEP_SUMMARY
+          fi
